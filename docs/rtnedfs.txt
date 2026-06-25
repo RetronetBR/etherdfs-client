@@ -2,6 +2,15 @@
 
 This branch is the client-side counterpart of the server refactor.
 
+Version: 0.9.1
+
+Credits:
+
+- EtherDFS original project by Mateusz Viste.
+- Maintenance and patches by Michael Ortmann.
+- Fork maintenance and patches by Davide Bresolin.
+- Current fork maintenance and integration by Retronet Brasil.
+
 ## Goal
 
 Split the DOS client into three layers:
@@ -16,7 +25,7 @@ This will make it possible to keep the current raw Ethernet mode while adding a 
 
 The implementation started in `src/ETHERDFS.C`, but the first refactor step has already split out shared helpers and packet-driver transport:
 
-- `src/clientcore.c`
+- `src/core.c`
   - shared helpers reused across modules
   - string and checksum helpers
 
@@ -34,7 +43,7 @@ The implementation started in `src/ETHERDFS.C`, but the first refactor step has 
 
 ## Proposed split
 
-### `client_proto.c/.h`
+### `core.c/.h`
 
 Responsibilities:
 
@@ -62,7 +71,7 @@ Responsibilities:
 - DOS SDA/CDS/SFT/DTA integration
 - map DOS calls to protocol helpers
 
-### `client_core.c/.h`
+### `core.c/.h`
 
 Responsibilities:
 

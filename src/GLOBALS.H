@@ -34,7 +34,7 @@ static unsigned char dbg_hexc[16] = "0123456789ABCDEF";
 #define GLOB_DATOFF_PSPSEG 4
 #define GLOB_DATOFF_PKTHANDLE 6
 #define GLOB_DATOFF_PKTINT 8
-static struct tsrshareddata {
+struct tsrshareddata {
 /*offs*/
 /*  0 */ unsigned short prev_2f_handler_seg; /* seg:off of the previous 2F handler */
 /*  2 */ unsigned short prev_2f_handler_off; /* (so I can call it for all queries  */
@@ -44,34 +44,16 @@ static struct tsrshareddata {
 /*  8 */ unsigned char pktint;     /* software interrupt of the packet driver */
 
          unsigned char ldrv[26]; /* local to remote drives mappings (0=A:, 1=B, etc */
-} glob_data;
+};
+
+extern struct tsrshareddata glob_data;
 
 /* global variables related to packet driver management and handling frames */
-static unsigned char glob_pktdrv_recvbuff[FRAMESIZE];
-static signed short volatile glob_pktdrv_recvbufflen; /* length of the frame in buffer, 0 means "free", and neg value means "awaiting" */
-static unsigned char glob_pktdrv_sndbuff[FRAMESIZE]; /* this not only is my send-frame buffer, but I also use it to store permanently lmac, rmac, ethertype and PROTOVER at proper places */
-static unsigned long glob_pktdrv_pktcall;     /* vector address of the pktdrv interrupt */
+extern unsigned char glob_pktdrv_sndbuff[FRAMESIZE]; /* this not only is my send-frame buffer, but I also use it to store permanently lmac, rmac, ethertype and PROTOVER at proper places */
+extern unsigned long glob_pktdrv_pktcall;     /* vector address of the pktdrv interrupt */
 
 /* a few definitions for data that points to my sending buffer */
 #define GLOB_LMAC (glob_pktdrv_sndbuff + 6) /* local MAC address */
 #define GLOB_RMAC (glob_pktdrv_sndbuff)     /* remote MAC address */
-
-static unsigned char glob_reqdrv;  /* the requested drive, set by the INT 2F *
-                                    * handler and read by process2f()        */
-
-static unsigned short glob_reqstkword; /* WORD saved from the stack (used by SETATTR) */
-static struct sdastruct far *glob_sdaptr; /* pointer to DOS SDA (set by main() at *
-                                           * startup, used later by process2f()   */
-
-/* seg:off addresses of the old (DOS) stack */
-static unsigned short glob_oldstack_seg;
-static unsigned short glob_oldstack_off;
-
-/* the INT 2F "multiplex id" registerd by EtherDFS */
-static unsigned char glob_multiplexid;
-
-/* an INTPACK structure used to store registers as set when INT2F is called */
-static union INTPACK glob_intregs;
-
 
 #endif

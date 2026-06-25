@@ -3,7 +3,7 @@
  */
 
 #include <i86.h>
-#include "clientcore.h"
+#include "core.h"
 #include "globals.h"
 #include "version.h"
 #include "pktdrv.h"
@@ -13,6 +13,10 @@
 
 /* all the resident code goes to segment 'BEGTEXT' */
 #pragma code_seg(BEGTEXT, CODE)
+
+/* receive buffer state belongs to the transport layer only */
+static unsigned char glob_pktdrv_recvbuff[FRAMESIZE];
+static signed short volatile glob_pktdrv_recvbufflen; /* length of the frame in buffer, 0 means "free", and neg value means "awaiting" */
 
 /* this function is called two times by the packet driver. One time for
  * telling that a packet is incoming, and how big it is, so the application

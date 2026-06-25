@@ -2,7 +2,13 @@
  * Shared helpers for the EtherDFS DOS client.
  */
 
-#include "clientcore.h"
+#include "core.h"
+#include "globals.h"
+
+/* shared state used by both the client core and the packet driver transport */
+struct tsrshareddata glob_data;
+unsigned char glob_pktdrv_sndbuff[FRAMESIZE];
+unsigned long glob_pktdrv_pktcall;
 
 /* copies l bytes from *s to *d */
 void copybytes(void far *d, void far *s, unsigned int l) {

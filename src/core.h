@@ -2,8 +2,8 @@
  * Shared EtherDFS client helpers and future transport API.
  */
 
-#ifndef CLIENTCORE_SENTINEL
-#define CLIENTCORE_SENTINEL
+#ifndef CORE_SENTINEL
+#define CORE_SENTINEL
 
 #ifndef FRAMESIZE
 #define FRAMESIZE 1090

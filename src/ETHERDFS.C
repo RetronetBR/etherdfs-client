@@ -25,7 +25,7 @@
 
 #include <i86.h>     /* union INTPACK */
 #include "chint.h"   /* _mvchain_intr() */
-#include "clientcore.h" /* shared helpers and future transport API */
+#include "core.h"       /* shared helpers and future transport API */
 #include "pktdrv.h"    /* packet driver transport */
 #include "version.h" /* program & protocol version */
 
@@ -42,6 +42,23 @@
 
 /* all the resident code goes to segment 'BEGTEXT' */
 #pragma code_seg(BEGTEXT, CODE)
+
+/* process2f() private state */
+static unsigned char glob_reqdrv;  /* the requested drive, set by the INT 2F *
+                                    * handler and read by process2f()        */
+static unsigned short glob_reqstkword; /* WORD saved from the stack (used by SETATTR) */
+static struct sdastruct far *glob_sdaptr; /* pointer to DOS SDA (set by main() at *
+                                           * startup, used later by process2f()   */
+
+/* seg:off addresses of the old (DOS) stack */
+static unsigned short glob_oldstack_seg;
+static unsigned short glob_oldstack_off;
+
+/* the INT 2F "multiplex id" registered by EtherDFS */
+static unsigned char glob_multiplexid;
+
+/* an INTPACK structure used to store registers as set when INT2F is called */
+static union INTPACK glob_intregs;
 
 
 /* translates a drive letter (either upper- or lower-case) into a number (A=0,
@@ -308,7 +325,7 @@ void process2f(void) {
         /* CX = number of bytes to write (to be updated with number of bytes actually written) */
         /* SDA DTA = read buffer */
       struct sftstruct far *sftptr = MK_FP(glob_intregs.x.es, glob_intregs.x.di);
-      unsigned short bytesleft, chunklen, written = 0;
+      unsigned short more, bytesleft, chunklen, written = 0;
       /* is the file open for read-only? */
       if ((sftptr->open_mode & 3) == 0) {
         FAILFLAG(5); /* "access denied" */
@@ -318,7 +335,11 @@ void process2f(void) {
       /* do multiple write operations so chunks can fit in my eth frames */
       bytesleft = glob_intregs.x.cx;
 
-      while (bytesleft > 0) {
+      /* WRITEFIL with length 0 is used by DOS to truncate the file at the
+       * current file position, so we still need to forward a zero-length write
+       * request to the server. */
+      more = 1;
+      while (more != 0) {
         unsigned short len;
         chunklen = bytesleft;
         if (chunklen > FRAMESIZE - 66) chunklen = FRAMESIZE - 66;
@@ -340,6 +361,7 @@ void process2f(void) {
           glob_intregs.x.cx = written;
           sftptr->file_pos += len;
           if (sftptr->file_pos > sftptr->file_size) sftptr->file_size = sftptr->file_pos;
+          more = (bytesleft > 0 ? 1 : 0);
           if (len != chunklen) break; /* something bad happened on the other side */
         }
       }
@@ -943,13 +965,14 @@ static void outmsg(char *s) {
 #define ARGFL_AUTO 2
 #define ARGFL_UNLOAD 4
 #define ARGFL_NOCKSUM 8
+#define ARGFL_SILENT 16
 
 /* a structure used to pass and decode arguments between main() and parseargv() */
 struct argstruct {
   int argc;    /* original argc */
   char **argv; /* original argv */
   unsigned short pktint; /* custom packet driver interrupt */
-  unsigned char flags; /* ARGFL_QUIET, ARGFL_AUTO, ARGFL_UNLOAD, ARGFL_CKSUM */
+  unsigned char flags; /* ARGFL_QUIET, ARGFL_AUTO, ARGFL_UNLOAD, ARGFL_CKSUM, ARGFL_SILENT */
 };
 
 
@@ -992,6 +1015,10 @@ static int parseargv(struct argstruct *args) {
         case 'q':
           if (arg != NULL) return(-4);
           args->flags |= ARGFL_QUIET;
+          break;
+        case 's':
+          if (arg != NULL) return(-4);
+          args->flags |= ARGFL_SILENT | ARGFL_QUIET;
           break;
         case 'p':
           if (arg == NULL) return(-4);
@@ -1182,7 +1209,9 @@ int main(int argc, char **argv) {
   args.argc = argc;
   args.argv = argv;
   if (parseargv(&args) != 0) {
-    #include "msg/help.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg/help.c"
+    }
     return(1);
   }
 
@@ -1197,7 +1226,9 @@ int main(int argc, char **argv) {
     done:
   }
   if (tmpflag < 5) { /* tmpflag contains DOS version or 0 for 'unknown' */
-    #include "msg\\unsupdos.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\unsupdos.c"
+    }
     return(1);
   }
 
@@ -1212,7 +1243,9 @@ int main(int argc, char **argv) {
     goodtogo:
   }
   if (tmpflag != 0) {
-    #include "msg\\noredir.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\noredir.c"
+    }
     return(1);
   }
 
@@ -1227,7 +1260,9 @@ int main(int argc, char **argv) {
     /* am I loaded at all? */
     etherdfsid = findfreemultiplex(&tmpflag);
     if (tmpflag == 0) { /* not loaded, cannot unload */
-      #include "msg\\notload.c"
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\notload.c"
+      }
       return(1);
     }
     /* am I still at the top of the int 2Fh chain? */
@@ -1249,7 +1284,9 @@ int main(int argc, char **argv) {
     int2fptr = (unsigned char far *)MK_FP(myseg, myoff) + 24; /* the interrupt handler's signature appears at offset 24 (this might change at each source code modification) */
     /* look for the "MVet" signature */
     if ((int2fptr[0] != 'M') || (int2fptr[1] != 'V') || (int2fptr[2] != 'e') || (int2fptr[3] != 't')) {
-      #include "msg\\othertsr.c";
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\othertsr.c";
+      }
       return(1);
     }
     /* get the ptr to TSR's data */
@@ -1275,7 +1312,9 @@ int main(int argc, char **argv) {
       pop ax
     }
     if (myseg == 0xffffu) {
-      #include "msg\\tsrcomfa.c"
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\tsrcomfa.c"
+      }
       return(1);
     }
     tsrdata = MK_FP(myseg, myoff);
@@ -1351,7 +1390,7 @@ int main(int argc, char **argv) {
     freeseg(mydataseg);
     freeseg(tsrdata->pspseg);
     /* all done */
-    if ((args.flags & ARGFL_QUIET) == 0) {
+    if (((args.flags & ARGFL_QUIET) == 0) && ((args.flags & ARGFL_SILENT) == 0)) {
       #include "msg\\unloaded.c"
     }
     return(0);
@@ -1373,10 +1412,14 @@ int main(int argc, char **argv) {
   /* is the TSR installed already? */
   glob_multiplexid = findfreemultiplex(&tmpflag);
   if (tmpflag != 0) { /* already loaded */
-    #include "msg\\alrload.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\alrload.c"
+    }
     return(1);
   } else if (glob_multiplexid == 0) { /* no free multiplex id found */
-    #include "msg\\nomultpx.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\nomultpx.c"
+    }
     return(1);
   }
 
@@ -1385,11 +1428,15 @@ int main(int argc, char **argv) {
     if (glob_data.ldrv[i] == 0xff) continue;
     cds = getcds(i);
     if (cds == NULL) {
-      #include "msg\\mapfail.c"
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\mapfail.c"
+      }
       return(1);
     }
     if (cds->flags != 0) {
-      #include "msg\\drvactiv.c"
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\drvactiv.c"
+      }
       return(1);
     }
   }
@@ -1398,7 +1445,9 @@ int main(int argc, char **argv) {
    * as DS */
   newdataseg = allocseg(DATASEGSZ);
   if (newdataseg == 0) {
-    #include "msg\\memfail.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\memfail.c"
+    }
     return(1);
   }
 
@@ -1435,7 +1484,9 @@ int main(int argc, char **argv) {
 
   /* patch the TSR and pktdrv_recv() so they use my new DS */
   if (updatetsrds() != 0) {
-    #include "msg\\relfail.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\relfail.c"
+    }
     freeseg(newdataseg);
     return(1);
   }
@@ -1454,7 +1505,9 @@ int main(int argc, char **argv) {
   }
   /* has it succeeded? */
   if (glob_data.pktint == 0) {
-    #include "msg\\pktdfail.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\pktdfail.c"
+    }
     freeseg(newdataseg);
     return(1);
   }
@@ -1469,7 +1522,9 @@ int main(int argc, char **argv) {
     for (i = 0; glob_data.ldrv[i] == 0xff; i++); /* find first mapped disk */
     /* send a discovery frame that will update glob_rmac */
     if (sendquery(AL_DISKSPACE, i, 0, &answer, &ax, 1) != 6) {
-      #include "msg\\nosrvfnd.c"
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\nosrvfnd.c"
+      }
       pktdrv_free(glob_pktdrv_pktcall); /* free the pkt drv and quit */
       freeseg(newdataseg);
       return(1);
@@ -1489,7 +1544,7 @@ int main(int argc, char **argv) {
     cds->current_path[3] = 0;
   }
 
-  if ((args.flags & ARGFL_QUIET) == 0) {
+  if (((args.flags & ARGFL_QUIET) == 0) && ((args.flags & ARGFL_SILENT) == 0)) {
     char buff[20];
     #include "msg\\instlled.c"
     for (i = 0; i < 6; i++) {

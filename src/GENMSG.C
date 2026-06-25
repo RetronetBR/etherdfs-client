@@ -76,6 +76,7 @@ int main(void) {
     "  /p=XX   use packet driver at interrupt XX (autodetect otherwise)\r\n"
     "  /n      disable EtherDFS checksums\r\n"
     "  /q      quiet mode (print nothing if loaded/unloaded successfully)\r\n"
+    "  /s      silent mode (print nothing at all)\r\n"
     "  /u      unload EtherDFS from memory\r\n"
     "\r\n"
     "Use '::' as SRVMAC for server auto-discovery.\r\n"

@@ -126,12 +126,18 @@ program has bugs, this one is surely not an exception. I can only recommend
 that you perform periodic backups of your data, just in case.
 
 
-===[ Contact the author ]=====================================================
+===[ Contact the maintainers ]================================================
 
 I'm always happy to get feedback about my software: bug reports, feature
 requests, or simply knowing that you use it and it works for you.
-You won't get my e-mail address here, but you should find contact pointers to
-me on my website: http://mateusz.viste.fr.
+Current development is carried by Retronet Brasil in this fork:
+https://github.com/RetronetBR/etherdfs-client
+
+Project lineage:
+ - original EtherDFS client by Mateusz Viste,
+ - maintenance and patches by Michael Ortmann,
+ - fork maintenance and patches by Davide Bresolin,
+ - current fork maintenance by Retronet Brasil.
 
 
 ===[ License ]================================================================
@@ -139,6 +145,9 @@ me on my website: http://mateusz.viste.fr.
 EtherDFS is distributed under the terms of the MIT License, as listed below.
 
 Copyright (C) 2017, 2018 Mateusz Viste
+Copyright (c) 2020 Michael Ortmann
+Copyright (c) 2021, 2022 Davide Bresolin
+Copyright (c) 2026 Mario Nunes, Retronet Brasil
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

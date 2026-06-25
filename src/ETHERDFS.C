@@ -25,14 +25,12 @@
 
 #include <i86.h>     /* union INTPACK */
 #include "chint.h"   /* _mvchain_intr() */
+#include "core.h"       /* shared helpers and future transport API */
+#include "pktdrv.h"    /* packet driver transport */
 #include "version.h" /* program & protocol version */
 
 /* set DEBUGLEVEL to 0, 1 or 2 to turn on debug mode with desired verbosity */
 #define DEBUGLEVEL 0
-
-/* define the maximum size of a frame, as sent or received by etherdfs.
- * example: value 1084 accomodates payloads up to 1024 bytes +all headers */
-#define FRAMESIZE 1090
 
 #include "dosstruc.h" /* definitions of structures used by DOS */
 #include "globals.h"  /* global variables used by etherdfs */
@@ -45,122 +43,22 @@
 /* all the resident code goes to segment 'BEGTEXT' */
 #pragma code_seg(BEGTEXT, CODE)
 
+/* process2f() private state */
+static unsigned char glob_reqdrv;  /* the requested drive, set by the INT 2F *
+                                    * handler and read by process2f()        */
+static unsigned short glob_reqstkword; /* WORD saved from the stack (used by SETATTR) */
+static struct sdastruct far *glob_sdaptr; /* pointer to DOS SDA (set by main() at *
+                                           * startup, used later by process2f()   */
 
-/* copies l bytes from *s to *d */
-static void copybytes(void far *d, void far *s, unsigned int l) {
-  while (l != 0) {
-    l--;
-    *(unsigned char far *)d = *(unsigned char far *)s;
-    d = (unsigned char far *)d + 1;
-    s = (unsigned char far *)s + 1;
-  }
-}
+/* seg:off addresses of the old (DOS) stack */
+static unsigned short glob_oldstack_seg;
+static unsigned short glob_oldstack_off;
 
-static unsigned short mystrlen(void far *s) {
-  unsigned short res = 0;
-  while (*(unsigned char far *)s != 0) {
-    res++;
-    s = ((unsigned char far *)s) + 1;
-  }
-  return(res);
-}
+/* the INT 2F "multiplex id" registered by EtherDFS */
+static unsigned char glob_multiplexid;
 
-/* returns -1 if the NULL-terminated s string contains any wildcard (?, *)
- * character. otherwise returns the length of the string. */
-static int len_if_no_wildcards(char far *s) {
-  int r = 0;
-  for (;;) {
-    switch (*s) {
-      case 0: return(r);
-      case '?':
-      case '*': return(-1);
-    }
-    r++;
-    s++;
-  }
-}
-
-/* computes a BSD checksum of l bytes at dataptr location */
-static unsigned short bsdsum(unsigned char *dataptr, unsigned short l) {
-  unsigned short cksum = 0;
-  _asm {
-    cld           /* clear direction flag */
-    xor bx, bx    /* bx will hold the result */
-    xor ax, ax
-    mov cx, l
-    mov si, dataptr
-    iterate:
-    lodsb         /* load a byte from DS:SI into AL and INC SI */
-    ror bx, 1
-    add bx, ax
-    dec cx        /* DEC CX + JNZ could be replaced by a single LOOP */
-    jnz iterate   /* instruction, but DEC+JNZ is 3x faster (on 8086) */
-    mov cksum, bx
-  }
-  return(cksum);
-}
-
-/* this function is called two times by the packet driver. One time for
- * telling that a packet is incoming, and how big it is, so the application
- * can prepare a buffer for it and hand it back to the packet driver. the
- * second call is just to let know that the frame has been copied into the
- * buffer. This is a naked function - I don't need the compiler to get into
- * the way when dealing with packet driver callbacks.
- * IMPORTANT: this function must take care to modify ONLY the registers
- * ES and DI - packet drivers can be easily confused should anything else
- * be modified. */
-void __declspec(naked) far pktdrv_recv(void) {
-  _asm {
-    jmp skip
-    SIG db 'p','k','t','r'
-    skip:
-    /* save DS and flags to stack */
-    push ds  /* save old ds (I will change it) */
-    push bx  /* save bx (I use it as a temporary register) */
-    pushf    /* save flags */
-    /* set my custom DS (not 0, it has been patched at runtime already) */
-    mov bx, 0
-    mov ds, bx
-    /* handle the call */
-    cmp ax, 0
-    jne secondcall /* if ax != 0, then packet driver just filled my buffer */
-    /* first call: the packet driver needs a buffer of CX bytes */
-    cmp cx, FRAMESIZE /* is cx > FRAMESIZE ? (unsigned) */
-    ja nobufferavail  /* it is too small (that's what she said!) */
-    /* see if buffer not filled already... */
-    cmp glob_pktdrv_recvbufflen, 0 /* is bufflen > 0 ? (signed) */
-    jg nobufferavail  /* if signed > 0, then we are busy already */
-
-    /* buffer is available, set its seg:off in es:di */
-    push ds /* set es:di to recvbuff */
-    pop es
-    mov di, offset glob_pktdrv_recvbuff
-    /* set bufferlen to expected len and switch it to neg until data comes */
-    mov glob_pktdrv_recvbufflen, cx
-    neg glob_pktdrv_recvbufflen
-    /* restore flags, bx and ds, then return */
-    jmp restoreandret
-
-  nobufferavail: /* no buffer available, or it's too small -> fail */
-    xor bx,bx      /* set bx to zero... */
-    push bx        /* and push it to the stack... */
-    push bx        /* twice */
-    pop es         /* zero out es and di - this tells the */
-    pop di         /* packet driver 'sorry no can do'     */
-    /* restore flags, bx and ds, then return */
-    jmp restoreandret
-
-  secondcall: /* second call: I've just got data in buff */
-    /* I switch back bufflen to positive so the app can see that something is there now */
-    neg glob_pktdrv_recvbufflen
-    /* restore flags, bx and ds, then return */
-  restoreandret:
-    popf   /* restore flags */
-    pop bx /* restore bx */
-    pop ds /* restore ds */
-    retf
-  }
-}
+/* an INTPACK structure used to store registers as set when INT2F is called */
+static union INTPACK glob_intregs;
 
 
 /* translates a drive letter (either upper- or lower-case) into a number (A=0,
@@ -274,126 +172,6 @@ regs.h.ch
 regs.h.al
 regs.h.ah
 */
-
-
-/* sends query out, as found in glob_pktdrv_sndbuff, and awaits for an answer.
- * this function returns the length of replyptr, or 0xFFFF on error. */
-static unsigned short sendquery(unsigned char query, unsigned char drive, unsigned short bufflen, unsigned char **replyptr, unsigned short **replyax, unsigned int updatermac) {
-  static unsigned char seq;
-  unsigned short count;
-  unsigned char t;
-  unsigned char volatile far *rtc = (unsigned char far *)0x46C; /* this points to a char, while the rtc timer is a word - but I care only about the lowest 8 bits. Be warned that this location won't increment while interrupts are disabled! */
-
-  /* resolve remote drive - no need to validate it, it has been validated
-   * already by inthandler() */
-  drive = glob_data.ldrv[drive];
-
-  /* bufflen provides payload's lenght, but I prefer knowing the frame's len */
-  bufflen += 60;
-
-  /* if query too long then quit */
-  if (bufflen > sizeof(glob_pktdrv_sndbuff)) return(0);
-  /* inc seq */
-  seq++;
-  /* I do not fill in ethernet headers (src mac, dst mac, ethertype), nor
-   * PROTOVER, since all these have been inited already at transient time */
-  /* padding (38 bytes) */
-  ((unsigned short *)glob_pktdrv_sndbuff)[26] = bufflen; /* total frame len */
-  glob_pktdrv_sndbuff[57] = seq;   /* seq number */
-  glob_pktdrv_sndbuff[58] = drive;
-  glob_pktdrv_sndbuff[59] = query; /* AL value (query) */
-  if (glob_pktdrv_sndbuff[56] & 128) { /* if CKSUM enabled, compute it */
-    /* fill in the BSD checksum at offset 54 */
-    ((unsigned short *)glob_pktdrv_sndbuff)[27] = bsdsum(glob_pktdrv_sndbuff + 56, bufflen - 56);
-  }
-  /* I do not copy anything more into glob_pktdrv_sndbuff - the caller is
-   * expected to have already copied all relevant data into glob_pktdrv_sndbuff+60
-   * copybytes((unsigned char far *)glob_pktdrv_sndbuff + 60, (unsigned char far *)buff, bufflen);
-   */
-
-  /* send the query frame and wait for an answer for about 100ms. then, resend
-   * the query again and again, up to 5 times. the RTC clock at 0x46C is used
-   * as a timing reference. */
-  glob_pktdrv_recvbufflen = 0; /* mark the receiving buffer empty */
-  for (count = 5; count != 0; count--) { /* faster than count=0; count<5; count++ */
-    /* send the query frame out */
-    _asm {
-      /* save registers */
-      push ax
-      push cx
-      push dx /* may be changed by the packet driver (set to errno) */
-      push si
-      pushf /* must be last register pushed (expected by 'call') */
-      /* */
-      mov ah, 4h   /* SendPkt */
-      mov cx, bufflen
-      mov si, offset glob_pktdrv_sndbuff /* DS:SI points to buff, I do not
-                                 modify DS because the buffer should already
-                                 be in my data segment (small memory model) */
-      /* int to variable vector is a mess, so I have fetched its vector myself
-       * and pushf + cli + call far it now to simulate a regular int */
-      /* pushf -- already on the stack */
-      cli
-      call dword ptr glob_pktdrv_pktcall
-      /* restore registers (but not pushf, already restored by call) */
-      pop si
-      pop dx
-      pop cx
-      pop ax
-    }
-
-    /* wait for (and validate) the answer frame */
-    t = *rtc;
-    for (;;) {
-      int i;
-      if ((t != *rtc) && (t+1 != *rtc) && (*rtc != 0)) break; /* timeout, retry */
-      if (glob_pktdrv_recvbufflen < 1) continue;
-      /* I've got something! */
-      /* is the frame long enough for me to care? */
-      if (glob_pktdrv_recvbufflen < 60) goto ignoreframe;
-      /* is it for me? (correct src mac & dst mac) */
-      for (i = 0; i < 6; i++) {
-        if (glob_pktdrv_recvbuff[i] != GLOB_LMAC[i]) goto ignoreframe;
-        if ((updatermac == 0) && (glob_pktdrv_recvbuff[i+6] != GLOB_RMAC[i])) goto ignoreframe;
-      }
-      /* is the ethertype and seq what I expect? */
-      if ((((unsigned short *)glob_pktdrv_recvbuff)[6] != 0xF5EDu) || (glob_pktdrv_recvbuff[57] != seq)) goto ignoreframe;
-
-      /* validate frame length (if provided) */
-      if (((unsigned short *)glob_pktdrv_recvbuff)[26] > glob_pktdrv_recvbufflen) {
-        /* frame appears to be truncated */
-        goto ignoreframe;
-      }
-      if (((unsigned short *)glob_pktdrv_recvbuff)[26] < 60) {
-        /* malformed frame */
-        goto ignoreframe;
-      }
-      glob_pktdrv_recvbufflen = ((unsigned short *)glob_pktdrv_recvbuff)[26];
-
-      /* if CKSUM enabled, check it on received frame */
-      if (glob_pktdrv_sndbuff[56] & 128) {
-        /* is the cksum ok? */
-        if (bsdsum(glob_pktdrv_recvbuff + 56, glob_pktdrv_recvbufflen - 56) != (((unsigned short *)glob_pktdrv_recvbuff)[27])) {
-          /* DEBUG - prints a '!' on screen on cksum error */ /*{
-            unsigned short far *v = (unsigned short far *)0xB8000000l;
-            v[0] = 0x4000 | '!';
-          }*/
-          goto ignoreframe;
-        }
-      }
-
-      /* return buffer (without headers and seq) */
-      *replyptr = glob_pktdrv_recvbuff + 60;
-      *replyax = (unsigned short *)(glob_pktdrv_recvbuff + 58);
-      /* update glob_rmac if needed, then return */
-      if (updatermac != 0) copybytes(GLOB_RMAC, glob_pktdrv_recvbuff + 6, 6);
-      return(glob_pktdrv_recvbufflen - 60);
-      ignoreframe: /* ignore this frame and wait for the next one */
-      glob_pktdrv_recvbufflen = 0; /* mark the buffer empty */
-    }
-  }
-  return(0xFFFFu); /* return error */
-}
 
 
 /* reset CF (set on error only) and AX (expected to contain the error code,
@@ -547,7 +325,7 @@ void process2f(void) {
         /* CX = number of bytes to write (to be updated with number of bytes actually written) */
         /* SDA DTA = read buffer */
       struct sftstruct far *sftptr = MK_FP(glob_intregs.x.es, glob_intregs.x.di);
-      unsigned short bytesleft, chunklen, written = 0;
+      unsigned short more, bytesleft, chunklen, written = 0;
       /* is the file open for read-only? */
       if ((sftptr->open_mode & 3) == 0) {
         FAILFLAG(5); /* "access denied" */
@@ -557,7 +335,11 @@ void process2f(void) {
       /* do multiple write operations so chunks can fit in my eth frames */
       bytesleft = glob_intregs.x.cx;
 
-      while (bytesleft > 0) {
+      /* WRITEFIL with length 0 is used by DOS to truncate the file at the
+       * current file position, so we still need to forward a zero-length write
+       * request to the server. */
+      more = 1;
+      while (more != 0) {
         unsigned short len;
         chunklen = bytesleft;
         if (chunklen > FRAMESIZE - 66) chunklen = FRAMESIZE - 66;
@@ -579,6 +361,7 @@ void process2f(void) {
           glob_intregs.x.cx = written;
           sftptr->file_pos += len;
           if (sftptr->file_pos > sftptr->file_size) sftptr->file_size = sftptr->file_pos;
+          more = (bytesleft > 0 ? 1 : 0);
           if (len != chunklen) break; /* something bad happened on the other side */
         }
       }
@@ -1101,125 +884,6 @@ void __interrupt __far inthandler(union INTPACK r) {
 void begtextend(void) {
 }
 
-/* registers a packet driver handle to use on subsequent calls */
-static int pktdrv_accesstype(void) {
-  unsigned char cflag = 0;
-
-  _asm {
-    mov ax, 201h        /* AH=subfunction access_type(), AL=if_class=1(eth) */
-    mov bx, 0ffffh      /* if_type = 0xffff means 'all' */
-    mov dl, 0           /* if_number: 0 (first interface) */
-    /* DS:SI should point to the ethertype value in network byte order */
-    mov si, offset glob_pktdrv_sndbuff + 12 /* I don't set DS, it's good already */
-    mov cx, 2           /* typelen (ethertype is 16 bits) */
-    /* ES:DI points to the receiving routine */
-    push cs /* write segment of pktdrv_recv into es */
-    pop es
-    mov di, offset pktdrv_recv
-    mov cflag, 1        /* pre-set the cflag variable to failure */
-    /* int to variable vector is a mess, so I have fetched its vector myself
-     * and pushf + cli + call far it now to simulate a regular int */
-    pushf
-    cli
-    call dword ptr glob_pktdrv_pktcall
-    /* get CF state - reset cflag if CF clear, and get pkthandle from AX */
-    jc badluck   /* Jump if Carry */
-    mov word ptr [glob_data + GLOB_DATOFF_PKTHANDLE], ax /* Pkt handle should be in AX */
-    mov cflag, 0
-    badluck:
-  }
-
-  if (cflag != 0) return(-1);
-  return(0);
-}
-
-/* get my own MAC addr. target MUST point to a space of at least 6 chars */
-static void pktdrv_getaddr(unsigned char *dst) {
-  _asm {
-    mov ah, 6                       /* subfunction: get_addr() */
-    mov bx, word ptr [glob_data + GLOB_DATOFF_PKTHANDLE];  /* handle */
-    push ds                         /* write segment of dst into es */
-    pop es
-    mov di, dst                     /* offset of dst (in small mem model dst IS an offset) */
-    mov cx, 6                       /* expected length (ethernet = 6 bytes) */
-    /* int to variable vector is a mess, so I have fetched its vector myself
-     * and pushf + cli + call far it now to simulate a regular int */
-    pushf
-    cli
-    call dword ptr glob_pktdrv_pktcall
-  }
-}
-
-
-static int pktdrv_init(unsigned short pktintparam, int nocksum) {
-  unsigned short far *intvect = (unsigned short far *)MK_FP(0, pktintparam << 2);
-  unsigned short pktdrvfuncoffs = *intvect;
-  unsigned short pktdrvfuncseg = *(intvect+1);
-  unsigned short rseg = 0, roff = 0;
-  char far *pktdrvfunc = (char far *)MK_FP(pktdrvfuncseg, pktdrvfuncoffs);
-  int i;
-  char sig[8];
-  /* preload sig with "PKT DRVR" -- I could it just as well with
-   * char sig[] = "PKT DRVR", but I want to avoid this landing in
-   * my DATA segment so it doesn't pollute the TSR memory space. */
-  sig[0] = 'P';
-  sig[1] = 'K';
-  sig[2] = 'T';
-  sig[3] = ' ';
-  sig[4] = 'D';
-  sig[5] = 'R';
-  sig[6] = 'V';
-  sig[7] = 'R';
-
-  /* set my ethertype to 0xF5ED (EDF5 in network byte order) */
-  glob_pktdrv_sndbuff[12] = 0xED;
-  glob_pktdrv_sndbuff[13] = 0xF5;
-  /* set protover and CKSUM flag in send buffer (I won't touch it again) */
-  if (nocksum == 0) {
-    glob_pktdrv_sndbuff[56] = PROTOVER | 128; /* protocol version */
-  } else {
-    glob_pktdrv_sndbuff[56] = PROTOVER;       /* protocol version */
-  }
-
-  pktdrvfunc += 3; /* skip three bytes of executable code */
-  for (i = 0; i < 8; i++) if (sig[i] != pktdrvfunc[i]) return(-1);
-
-  glob_data.pktint = pktintparam;
-
-  /* fetch the vector of the pktdrv interrupt and save it for later */
-  _asm {
-    mov ah, 35h /* AH=GetVect */
-    mov al, byte ptr [glob_data] + GLOB_DATOFF_PKTINT; /* AL=int number */
-    push es /* save ES and BX (will be overwritten) */
-    push bx
-    int 21h
-    mov rseg, es
-    mov roff, bx
-    pop bx
-    pop es
-  }
-  glob_pktdrv_pktcall = rseg;
-  glob_pktdrv_pktcall <<= 16;
-  glob_pktdrv_pktcall |= roff;
-
-  return(pktdrv_accesstype());
-}
-
-
-static void pktdrv_free(unsigned long pktcall) {
-  _asm {
-    mov ah, 3
-    mov bx, word ptr [glob_data + GLOB_DATOFF_PKTHANDLE]
-    /* int to variable vector is a mess, so I have fetched its vector myself
-     * and pushf + cli + call far it now to simulate a regular int */
-    pushf
-    cli
-    call dword ptr glob_pktdrv_pktcall
-  }
-  /* if (regs.x.cflag != 0) return(-1);
-  return(0);*/
-}
-
 static struct sdastruct far *getsda(void) {
   /* DOS 3.0+ - GET ADDRESS OF SDA (Swappable Data Area)
    * AX = 5D06h
@@ -1296,69 +960,19 @@ static void outmsg(char *s) {
   }
 }
 
-/* zero out an object of l bytes */
-static void zerobytes(void *obj, unsigned short l) {
-  unsigned char *o = obj;
-  while (l-- != 0) {
-    *o = 0;
-    o++;
-  }
-}
-
-/* expects a hex string of exactly two chars "XX" and returns its value, or -1
- * if invalid */
-static int hexpair2int(char *hx) {
-  unsigned char h[2];
-  unsigned short i;
-  /* translate hx[] to numeric values and validate */
-  for (i = 0; i < 2; i++) {
-    if ((hx[i] >= 'A') && (hx[i] <= 'F')) {
-      h[i] = hx[i] - ('A' - 10);
-    } else if ((hx[i] >= 'a') && (hx[i] <= 'f')) {
-      h[i] = hx[i] - ('a' - 10);
-    } else if ((hx[i] >= '0') && (hx[i] <= '9')) {
-      h[i] = hx[i] - '0';
-    } else { /* invalid */
-      return(-1);
-    }
-  }
-  /* compute the end result and return it */
-  i = h[0];
-  i <<= 4;
-  i |= h[1];
-  return(i);
-}
-
-/* translates an ASCII MAC address into a 6-bytes binary string */
-static int string2mac(unsigned char *d, char *mac) {
-  int i, v;
-  /* is it exactly 17 chars long? */
-  for (i = 0; mac[i] != 0; i++);
-  if (i != 17) return(-1);
-  /* are nibble pairs separated by colons? */
-  for (i = 2; i < 16; i += 3) if (mac[i] != ':') return(-1);
-  /* translate each byte to its numeric value */
-  for (i = 0; i < 16; i += 3) {
-    v = hexpair2int(mac + i);
-    if (v < 0) return(-1);
-    *d = v;
-    d++;
-  }
-  return(0);
-}
-
 
 #define ARGFL_QUIET 1
 #define ARGFL_AUTO 2
 #define ARGFL_UNLOAD 4
 #define ARGFL_NOCKSUM 8
+#define ARGFL_SILENT 16
 
 /* a structure used to pass and decode arguments between main() and parseargv() */
 struct argstruct {
   int argc;    /* original argc */
   char **argv; /* original argv */
   unsigned short pktint; /* custom packet driver interrupt */
-  unsigned char flags; /* ARGFL_QUIET, ARGFL_AUTO, ARGFL_UNLOAD, ARGFL_CKSUM */
+  unsigned char flags; /* ARGFL_QUIET, ARGFL_AUTO, ARGFL_UNLOAD, ARGFL_CKSUM, ARGFL_SILENT */
 };
 
 
@@ -1402,6 +1016,10 @@ static int parseargv(struct argstruct *args) {
           if (arg != NULL) return(-4);
           args->flags |= ARGFL_QUIET;
           break;
+        case 's':
+          if (arg != NULL) return(-4);
+          args->flags |= ARGFL_SILENT | ARGFL_QUIET;
+          break;
         case 'p':
           if (arg == NULL) return(-4);
           /* I expect an exactly 2-characters string */
@@ -1442,23 +1060,6 @@ static int parseargv(struct argstruct *args) {
   if ((drivemapflag == 0) || (gotmac == 0)) return(-6);
 
   return(0);
-}
-
-/* translates an unsigned byte into a 2-characters string containing its hex
- * representation. s needs to be at least 3 bytes long. */
-static void byte2hex(char *s, unsigned char b) {
-  char h[16];
-  unsigned short i;
-  /* pre-compute h[] with a string 0..F -- I could do the same thing easily
-   * with h[] = "0123456789ABCDEF", but then this would land inside the DATA
-   * segment, while I want to keep it in stack to avoid polluting the TSR's
-   * memory space */
-  for (i = 0; i < 10; i++) h[i] = '0' + i;
-  for (; i < 16; i++) h[i] = ('A' - 10) + i;
-  /* */
-  s[0] = h[b >> 4];
-  s[1] = h[b & 15];
-  s[2] = 0;
 }
 
 /* allocates sz bytes of memory and returns the segment to allocated memory or
@@ -1608,7 +1209,9 @@ int main(int argc, char **argv) {
   args.argc = argc;
   args.argv = argv;
   if (parseargv(&args) != 0) {
-    #include "msg/help.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg/help.c"
+    }
     return(1);
   }
 
@@ -1623,7 +1226,9 @@ int main(int argc, char **argv) {
     done:
   }
   if (tmpflag < 5) { /* tmpflag contains DOS version or 0 for 'unknown' */
-    #include "msg\\unsupdos.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\unsupdos.c"
+    }
     return(1);
   }
 
@@ -1638,7 +1243,9 @@ int main(int argc, char **argv) {
     goodtogo:
   }
   if (tmpflag != 0) {
-    #include "msg\\noredir.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\noredir.c"
+    }
     return(1);
   }
 
@@ -1653,7 +1260,9 @@ int main(int argc, char **argv) {
     /* am I loaded at all? */
     etherdfsid = findfreemultiplex(&tmpflag);
     if (tmpflag == 0) { /* not loaded, cannot unload */
-      #include "msg\\notload.c"
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\notload.c"
+      }
       return(1);
     }
     /* am I still at the top of the int 2Fh chain? */
@@ -1675,7 +1284,9 @@ int main(int argc, char **argv) {
     int2fptr = (unsigned char far *)MK_FP(myseg, myoff) + 24; /* the interrupt handler's signature appears at offset 24 (this might change at each source code modification) */
     /* look for the "MVet" signature */
     if ((int2fptr[0] != 'M') || (int2fptr[1] != 'V') || (int2fptr[2] != 'e') || (int2fptr[3] != 't')) {
-      #include "msg\\othertsr.c";
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\othertsr.c";
+      }
       return(1);
     }
     /* get the ptr to TSR's data */
@@ -1701,7 +1312,9 @@ int main(int argc, char **argv) {
       pop ax
     }
     if (myseg == 0xffffu) {
-      #include "msg\\tsrcomfa.c"
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\tsrcomfa.c"
+      }
       return(1);
     }
     tsrdata = MK_FP(myseg, myoff);
@@ -1777,7 +1390,7 @@ int main(int argc, char **argv) {
     freeseg(mydataseg);
     freeseg(tsrdata->pspseg);
     /* all done */
-    if ((args.flags & ARGFL_QUIET) == 0) {
+    if (((args.flags & ARGFL_QUIET) == 0) && ((args.flags & ARGFL_SILENT) == 0)) {
       #include "msg\\unloaded.c"
     }
     return(0);
@@ -1799,10 +1412,14 @@ int main(int argc, char **argv) {
   /* is the TSR installed already? */
   glob_multiplexid = findfreemultiplex(&tmpflag);
   if (tmpflag != 0) { /* already loaded */
-    #include "msg\\alrload.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\alrload.c"
+    }
     return(1);
   } else if (glob_multiplexid == 0) { /* no free multiplex id found */
-    #include "msg\\nomultpx.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\nomultpx.c"
+    }
     return(1);
   }
 
@@ -1811,11 +1428,15 @@ int main(int argc, char **argv) {
     if (glob_data.ldrv[i] == 0xff) continue;
     cds = getcds(i);
     if (cds == NULL) {
-      #include "msg\\mapfail.c"
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\mapfail.c"
+      }
       return(1);
     }
     if (cds->flags != 0) {
-      #include "msg\\drvactiv.c"
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\drvactiv.c"
+      }
       return(1);
     }
   }
@@ -1824,7 +1445,9 @@ int main(int argc, char **argv) {
    * as DS */
   newdataseg = allocseg(DATASEGSZ);
   if (newdataseg == 0) {
-    #include "msg\\memfail.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\memfail.c"
+    }
     return(1);
   }
 
@@ -1861,7 +1484,9 @@ int main(int argc, char **argv) {
 
   /* patch the TSR and pktdrv_recv() so they use my new DS */
   if (updatetsrds() != 0) {
-    #include "msg\\relfail.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\relfail.c"
+    }
     freeseg(newdataseg);
     return(1);
   }
@@ -1880,7 +1505,9 @@ int main(int argc, char **argv) {
   }
   /* has it succeeded? */
   if (glob_data.pktint == 0) {
-    #include "msg\\pktdfail.c"
+    if ((args.flags & ARGFL_SILENT) == 0) {
+      #include "msg\\pktdfail.c"
+    }
     freeseg(newdataseg);
     return(1);
   }
@@ -1895,7 +1522,9 @@ int main(int argc, char **argv) {
     for (i = 0; glob_data.ldrv[i] == 0xff; i++); /* find first mapped disk */
     /* send a discovery frame that will update glob_rmac */
     if (sendquery(AL_DISKSPACE, i, 0, &answer, &ax, 1) != 6) {
-      #include "msg\\nosrvfnd.c"
+      if ((args.flags & ARGFL_SILENT) == 0) {
+        #include "msg\\nosrvfnd.c"
+      }
       pktdrv_free(glob_pktdrv_pktcall); /* free the pkt drv and quit */
       freeseg(newdataseg);
       return(1);
@@ -1915,7 +1544,7 @@ int main(int argc, char **argv) {
     cds->current_path[3] = 0;
   }
 
-  if ((args.flags & ARGFL_QUIET) == 0) {
+  if (((args.flags & ARGFL_QUIET) == 0) && ((args.flags & ARGFL_SILENT) == 0)) {
     char buff[20];
     #include "msg\\instlled.c"
     for (i = 0; i < 6; i++) {

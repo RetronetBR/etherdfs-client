@@ -1,5 +1,14 @@
 EtherDFS changelog history
 
+v0.9.1 [2026-06-25]:
+ - client-side core split into `core.c` / `core.h`,
+ - packet transport isolated in `pktdrv.c`,
+ - `/s` silent mode added,
+ - DOS WRITEFIL zero-length truncation handling fixed,
+ - 8.3-safe source renames for the Open Watcom toolchain,
+ - packaging changed so `upx` is optional (`pack` target only),
+ - community patches integrated from Michael Ortmann, Davide Bresolin, and Retronet Brasil.
+
 v0.8.2 [2018-02-03]:
  - support for lock/unlock operations (INT 2Fh,110Ah).
 
